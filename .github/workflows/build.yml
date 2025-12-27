@@ -1,13 +1,13 @@
-name: Build & Publish ARM AUR Repo
+name: Build AUR Repo with aurutils
 
 on:
   push:
     branches: [ main ]
     paths:
-      - 'packages-list.yaml'
+      - 'packages‑list.yaml'
       - '.github/workflows/**'
   schedule:
-    - cron: '0 0 * * 0' # Weekly rebuild
+    - cron: '0 0 * * 0' # weekly
   workflow_dispatch:
 
 permissions:
@@ -17,123 +17,86 @@ permissions:
 
 jobs:
   build:
-    name: Build ARM64 AUR Packages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu‑latest
     env:
-      REPO_NAME: ${{ github.event.repository.name }}
-      OWNER: ${{ github.repository_owner }}
       GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
-      PACKAGES_YAML: packages-list.yaml
+      REPO_NAME: ${{ github.repository }}
+      REPO_OWNER: ${{ github.repository_owner }}
 
     steps:
-    - name: Checkout Repo
+    - name: Checkout
       uses: actions/checkout@v4
-      with:
-        submodules: recursive
 
-    - name: Install yq (Go version)
+    - name: Install prerequisites
       run: |
-        sudo apt-get update
-        sudo apt-get install -y wget
-        wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
-        chmod +x /usr/local/bin/yq
-    
-    - name: Parse packages list
-      id: parse_packages
-      run: |
-        PACKAGES=$(yq e '.packages[]' packages-list.yaml)
-        echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
-        echo "Packages to build: $PACKAGES"
-  
-    - name: Setup QEMU for ARM64
-      uses: docker/setup-qemu-action@v3
-      with:
-        platforms: arm64
+        sudo pacman‑key --init
+        sudo pacman‑key --populate archlinuxarm
+        sudo pacman ‑Syu --noconfirm base-devel git aurutils systemd
+        # enable systemd‑nspawn (aurutils uses it for clean chroot builds)
+        sudo mkdir ‑p /etc/systemd/nspawn
+        sudo systemctl enable systemd‑nspawn
 
-    - name: Setup Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Prepare GPG Key
+    - name: Import GPG key
       env:
         GPG_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_KEY }}
         GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
       run: |
-        mkdir -p ~/.gnupg
-        chmod 700 ~/.gnupg
-    
-        # Configure GPG for CI (avoid prompts)
-        echo "use-agent" >> ~/.gnupg/gpg.conf
-        echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
-        echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
-    
-        # Import
-        echo "$GPG_PRIVATE_KEY" | \
-            gpg --batch --import 2>/dev/null
-    
-        # Trust the key
-        echo -e "5\ny\n" | gpg --batch --command-fd 0 --edit-key "$GPG_KEY_ID" trust
-    
-        # Test
-        gpg --list-secret-keys --keyid-format LONG
+        mkdir ‑p ~/.gnupg
+        echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+        # allow loopback pinentry for signing
+        echo "allow‑loopback‑pinentry" >> ~/.gnupg/gpg‑agent.conf
+        echo $GPG_PASSPHRASE | gpg --batch --passphrase‑fd 0 \
+            --pinentry‑mode loopback --quick‑sign‑key $GPG_KEY_ID
+        gpg --list‑secret‑keys
 
-    - name: Fetch AUR PKGBUILDs
+    - name: Parse package list
+      id: pkgs
       run: |
-        mkdir -p aur-src
-        cd aur-src
-        for pkg in $PACKAGES; do
-          git clone https://aur.archlinux.org/$pkg.git || true
-        done
-    - name: Build packages in Docker
-      run: |
-        mkdir -p built
-        for d in aur-src/*; do
-          pkg=$(basename "$d")
-          echo "=== Building $pkg ==="
-          docker run --rm --privileged \
-            -v "$PWD/aur-src/$pkg:/build" \
-            -v "$HOME/.gnupg:/root/.gnupg" \
-            -w "/build" \
-            agners/archlinuxarm-arm64v8 \
-            bash -c "
-              pacman -Syu --disable-sandbox --noconfirm
-              pacman -S --disable-sandbox --noconfirm base-devel git sudo
-              useradd -m -G wheel -s /bin/bash builder
-              echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
-              chown -R builder /build
-              sudo -u builder bash -c '
-                makepkg --cleanbuild --force --noconfirm --sign --key $GPG_KEY_ID
-              '
-            "
-          cp aur-src/$pkg/*.pkg.tar.zst built/ || true
-          cp aur-src/$pkg/*.sig built/ || true
-        done
-    - name: Create pacman repo
-      run: |
-        mkdir -p _site/aarch64
-        mv built/* _site/aarch64/ || true
-        cd _site/aarch64
-        repo-add myarmrepo.db.tar.gz *.pkg.tar.zst || true
-        ln -sf myarmrepo.db.tar.gz myarmrepo.db
-        ln -sf myarmrepo.files.tar.gz myarmrepo.files
+        PACKAGES=$(yq e '.packages[]' packages‑list.yaml)
+        echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
 
-    - name: Generate pacman config
+    - name: Prepare local repo dir
       run: |
-        cat > _site/myarmrepo.conf << EOF
-        [myarmrepo]
+        mkdir ‑p repo
+        cd repo
+        repo‑add custom.db.tar.gz  # create initial empty database
+
+    - name: Sync & build AUR packages
+      run: |
+        aur sync \
+          --chroot \
+          --sign \
+          --no‑view \
+          --database‑dir repo \
+          $PACKAGES
+
+    - name: Commit built repo
+      run: |
+        git config user.name "github‑actions"
+        git config user.email "actions@github.com"
+        git add repo
+        git commit ‑m "Update built AUR repo"
+        git push
+
+    - name: Prepare for Pages
+      run: |
+        mkdir ‑p _site/aarch64
+        cp repo/* _site/aarch64/
+        # generate pacman config
+        cat > _site/myrepo.conf <<EOF
+        [aurrepo]
         SigLevel = Required TrustedOnly
-        Server = https://${OWNER}.github.io/${REPO_NAME}/aarch64
+        Server = https://${REPO_OWNER}.github.io/${REPO_NAME}/aarch64
         EOF
 
-    - name: Upload Pages Artifact
-      uses: actions/upload-pages-artifact@v3
+    - name: Upload Pages artifact
+      uses: actions/upload‑pages‑artifact@v3
       with:
         path: _site
 
   deploy:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu‑latest
     steps:
     - name: Deploy Pages
-      uses: actions/deploy-pages@v4
-
+      uses: actions/deploy‑pages@v4
