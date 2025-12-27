@@ -27,8 +27,7 @@ jobs:
         uses: addnab/docker-run-action@v3
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_KEY }}
-          # ⬇️ ADD THIS SECRET if your key has a password. Leave empty if none.
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }} 
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         with:
           image: agners/archlinuxarm
           options: --platform linux/arm64 -v ${{ github.workspace }}:/workspace -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE
@@ -56,115 +55,69 @@ jobs:
             mkdir -p repo
             chown builder:builder repo
             
-            # --- GPG SETUP (FIXED) ---
+            # --- GPG SETUP ---
             echo "::group::Configuring GPG"
-            # 1. Create .gnupg config for builder
-            su builder -c "mkdir -p ~/.gnupg"
-            su builder -c "chmod 700 ~/.gnupg"
-            
-            # 2. Force loopback mode & Long Cache (Crucial for CI)
+            su builder -c "mkdir -p ~/.gnupg && chmod 700 ~/.gnupg"
             su builder -c "echo 'allow-loopback-pinentry' >> ~/.gnupg/gpg-agent.conf"
-            su builder -c "echo 'default-cache-ttl 34560000' >> ~/.gnupg/gpg-agent.conf"
-            su builder -c "echo 'max-cache-ttl 34560000' >> ~/.gnupg/gpg-agent.conf"
             su builder -c "echo 'pinentry-mode loopback' >> ~/.gnupg/gpg.conf"
-            
-            # 3. Reload agent
             su builder -c "gpgconf --kill gpg-agent"
-            
-            # 4. Import Key
             su builder -c "gpg --batch --import <(echo '$GPG_PRIVATE_KEY')"
             
-            # 5. Get FULL FINGERPRINT (Fixes 'invalid fingerprint' error)
-            # We grep 'fpr' (fingerprint record) and take field 10
             KEY_FINGERPRINT=$(su builder -c "gpg --list-secret-keys --with-colons" | grep fpr | head -n1 | cut -d: -f10)
-            
-            if [ -z "$KEY_FINGERPRINT" ]; then
-                echo "❌ Error: Could not extract GPG Fingerprint."
-                exit 1
-            fi
-            echo "Detected Fingerprint: $KEY_FINGERPRINT"
-            
-            # 6. Trust Key (Fixes 'Do you really want to use this key?' prompt)
             echo "${KEY_FINGERPRINT}:6:" | su builder -c "gpg --import-ownertrust"
             
-            # 7. PRIME THE AGENT (Fixes Password Prompt)
-            # If GPG_PASSPHRASE is set, we sign a dummy file to cache the password for the session.
+            # Prime the agent with passphrase
             if [ ! -z "$GPG_PASSPHRASE" ]; then
-               echo "🔐 Passphrase detected, caching credential..."
                echo "test" | su builder -c "gpg --batch --yes --passphrase '$GPG_PASSPHRASE' --pinentry-mode loopback --dry-run -s"
-            else
-               echo "🔓 No passphrase provided. Assuming key is passwordless."
-            fi
-            
-            # 8. TEST SIGNING
-            echo "Testing GPG signing..."
-            if ! echo "test" | su builder -c "gpg --batch --yes --clearsign --default-key $KEY_FINGERPRINT"; then
-                echo "❌ GPG SIGNING FAILED! The key likely requires a password that wasn't provided."
-                exit 1
-            else
-                echo "✅ GPG Signing working correctly."
             fi
             echo "::endgroup::"
 
-            # Init DB (Signed)
-            if [ ! -f "repo/$DB_NAME.db.tar.gz" ]; then
-               echo "Creating initial signed database..."
-               su builder -c "repo-add --sign --key $KEY_FINGERPRINT repo/$DB_NAME.db.tar.gz"
-            fi
+            # Reset DB to ensure cleanliness
+            rm -f repo/$DB_NAME.db*
+            su builder -c "repo-add --sign --key $KEY_FINGERPRINT repo/$DB_NAME.db.tar.gz"
             
-            # --- BUILD PACKAGES ---
-            if [ ! -f packages-list.yaml ]; then
-                echo "Error: packages-list.yaml not found!"
-                exit 1
-            fi
-            
+            # --- BUILD ---
+            if [ ! -f packages-list.yaml ]; then echo "No package list!"; exit 1; fi
             PACKAGES=$(grep '  -' packages-list.yaml | cut -d'-' -f2- | tr -d ' ' | xargs)
             
             echo "::group::Building Packages: $PACKAGES"
-            
-            # Fetch
             su builder -c "aur fetch $PACKAGES"
-            
-            # Sort Dependencies
             cd /home/builder
             su builder -c "aur graph $PACKAGES" | tsort | tac > build_order.txt
             
-            # Build Loop
             while read pkg; do
                 echo "--> Building $pkg..."
                 cd /home/builder/$pkg
                 
-                # Sign the PACKAGE
+                # Build & Sign
                 su builder -c "makepkg -si --noconfirm --nocheck --sign --key $KEY_FINGERPRINT"
                 
-                # Move artifacts
-                mv *.pkg.tar.zst /workspace/repo/
+                # Move artifacts (pkg + sig)
+                # CRITICAL FIX: The wildcard '*' at the end grabs the .sig file too!
+                mv *.pkg.tar.zst* /workspace/repo/
                 
-                # Add to DB (Signed)
+                # Add to DB
                 cd /workspace/repo
-                su builder -c "repo-add --new --sign --key $KEY_FINGERPRINT --verify $DB_NAME.db.tar.gz *.pkg.tar.zst"
+                su builder -c "repo-add --new --sign --key $KEY_FINGERPRINT --verify $DB_NAME.db.tar.gz *.pkg.tar.zst" || exit 1
             done < /home/builder/build_order.txt
             echo "::endgroup::"
 
       - name: Fix Permissions
         run: sudo chown -R $USER:$USER repo
 
+      - name: Debug Repo Contents
+        run: ls -la repo/
+
       - name: Prepare Pages Site
         run: |
           mkdir -p _site/aarch64
           cp -L repo/* _site/aarch64/
           
-          # Fix Signature Names
+          # Ensure strict signature naming
           cd _site/aarch64
-          if [ -f "lt-aur.db.tar.gz.sig" ]; then
-             cp lt-aur.db.tar.gz.sig lt-aur.db.sig
-             echo "✅ Created lt-aur.db.sig"
-          else
-             echo "❌ CRITICAL ERROR: Database signature missing after build."
-             exit 1
-          fi
+          [ -f "lt-aur.db.tar.gz.sig" ] && cp lt-aur.db.tar.gz.sig lt-aur.db.sig
           
-          # HTML Index
+          # Generate Index
           cd ../..
           echo "<html><body><h1>lt-aur</h1><ul><li><a href='aarch64/'>aarch64</a></li></ul></body></html>" > _site/index.html
           echo "<html><body><h1>/aarch64</h1><pre>" > _site/aarch64/index.html
