@@ -96,20 +96,18 @@ jobs:
             -w "/build" \
             agners/archlinuxarm-arm64v8 \
             bash -c "
-              pacman -Syu --noconfirm
-              pacman -S --noconfirm base-devel git sudo
+              pacman -Syu --disable-sandbox --noconfirm
+              pacman -S --disable-sandbox --noconfirm base-devel git sudo
               useradd -m -G wheel -s /bin/bash builder
               echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
               chown -R builder /build
               sudo -u builder bash -c '
-                makepkg --cleanbuild --force --noconfirm --sign \
-                  --key $GPG_KEY_ID
+                makepkg --cleanbuild --force --noconfirm --sign --key $GPG_KEY_ID
               '
             "
           cp aur-src/$pkg/*.pkg.tar.zst built/ || true
           cp aur-src/$pkg/*.sig built/ || true
         done
-
     - name: Create pacman repo
       run: |
         mkdir -p _site/aarch64
