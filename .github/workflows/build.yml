@@ -84,7 +84,6 @@ jobs:
         for pkg in $PACKAGES; do
           git clone https://aur.archlinux.org/$pkg.git || true
         done
-
     - name: Build packages in Docker
       run: |
         mkdir -p built
@@ -95,7 +94,7 @@ jobs:
             -v "$PWD/aur-src/$pkg:/build" \
             -v "$HOME/.gnupg:/root/.gnupg" \
             -w "/build" \
-            archlinux/archlinuxarm:latest-aarch64 \
+            agners/archlinuxarm-arm64v8 \
             bash -c "
               pacman -Syu --noconfirm
               pacman -S --noconfirm base-devel git sudo
