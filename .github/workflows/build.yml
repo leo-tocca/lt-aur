@@ -31,19 +31,20 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Install PyYAML & yq
+    - name: Install yq (Go version)
       run: |
         sudo apt-get update
-        sudo apt-get install -y python3-pip yq
-        pip3 install pyyaml
-
+        sudo apt-get install -y wget
+        wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+        chmod +x /usr/local/bin/yq
+    
     - name: Parse packages list
       id: parse_packages
       run: |
-        PACKAGES=$(yq e '.packages[]' $PACKAGES_YAML)
-        echo "PACKAGES='$PACKAGES'" >> $GITHUB_ENV
-        echo "Packages: $PACKAGES"
-
+        PACKAGES=$(yq e '.packages[]' packages-list.yaml)
+        echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
+        echo "Packages to build: $PACKAGES"
+  
     - name: Setup QEMU for ARM64
       uses: docker/setup-qemu-action@v3
       with:
