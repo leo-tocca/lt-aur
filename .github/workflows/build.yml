@@ -1,13 +1,10 @@
-name: Build AUR Repo with aurutils
+name: Build lt-aur Repo
 
 on:
   push:
-    branches: [ main ]
     paths:
-      - 'packages‑list.yaml'
+      - 'packages-list.yaml'
       - '.github/workflows/**'
-  schedule:
-    - cron: '0 0 * * 0' # weekly
   workflow_dispatch:
 
 permissions:
@@ -16,87 +13,179 @@ permissions:
   id-token: write
 
 jobs:
-  build:
-    runs-on: ubuntu‑latest
-    env:
-      GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
-      REPO_NAME: ${{ github.repository }}
-      REPO_OWNER: ${{ github.repository_owner }}
-
+  build-arm:
+    runs-on: ubuntu-latest
+    
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Install prerequisites
-      run: |
-        sudo pacman‑key --init
-        sudo pacman‑key --populate archlinuxarm
-        sudo pacman ‑Syu --noconfirm base-devel git aurutils systemd
-        # enable systemd‑nspawn (aurutils uses it for clean chroot builds)
-        sudo mkdir ‑p /etc/systemd/nspawn
-        sudo systemctl enable systemd‑nspawn
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-    - name: Import GPG key
-      env:
-        GPG_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_KEY }}
-        GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-      run: |
-        mkdir ‑p ~/.gnupg
-        echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-        # allow loopback pinentry for signing
-        echo "allow‑loopback‑pinentry" >> ~/.gnupg/gpg‑agent.conf
-        echo $GPG_PASSPHRASE | gpg --batch --passphrase‑fd 0 \
-            --pinentry‑mode loopback --quick‑sign‑key $GPG_KEY_ID
-        gpg --list‑secret‑keys
+      - name: Build in Arch ARM Container
+        uses: addnab/docker-run-action@v3
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+          # ⬇️ ADD THIS SECRET if your key has a password. Leave empty if none.
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }} 
+        with:
+          image: agners/archlinuxarm
+          options: --platform linux/arm64 -v ${{ github.workspace }}:/workspace -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE
+          run: |
+            # --- SETUP ---
+            cd /workspace
+            DB_NAME="lt-aur"
+            
+            # Install prerequisites
+            pacman-key --init
+            pacman-key --populate archlinuxarm
+            pacman -Syu --noconfirm base-devel git sudo
+            
+            # Setup Builder User
+            useradd -m builder
+            echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+            chmod 0440 /etc/sudoers.d/builder
+            
+            # Install aurutils
+            echo "::group::Installing aurutils"
+            su builder -c "cd ~ && git clone https://aur.archlinux.org/aurutils.git && cd aurutils && makepkg -si --noconfirm"
+            echo "::endgroup::"
+            
+            # Prepare Repo Dir
+            mkdir -p repo
+            chown builder:builder repo
+            
+            # --- GPG SETUP (FIXED) ---
+            echo "::group::Configuring GPG"
+            # 1. Create .gnupg config for builder
+            su builder -c "mkdir -p ~/.gnupg"
+            su builder -c "chmod 700 ~/.gnupg"
+            
+            # 2. Force loopback mode & Long Cache (Crucial for CI)
+            su builder -c "echo 'allow-loopback-pinentry' >> ~/.gnupg/gpg-agent.conf"
+            su builder -c "echo 'default-cache-ttl 34560000' >> ~/.gnupg/gpg-agent.conf"
+            su builder -c "echo 'max-cache-ttl 34560000' >> ~/.gnupg/gpg-agent.conf"
+            su builder -c "echo 'pinentry-mode loopback' >> ~/.gnupg/gpg.conf"
+            
+            # 3. Reload agent
+            su builder -c "gpgconf --kill gpg-agent"
+            
+            # 4. Import Key
+            su builder -c "gpg --batch --import <(echo '$GPG_PRIVATE_KEY')"
+            
+            # 5. Get FULL FINGERPRINT (Fixes 'invalid fingerprint' error)
+            # We grep 'fpr' (fingerprint record) and take field 10
+            KEY_FINGERPRINT=$(su builder -c "gpg --list-secret-keys --with-colons" | grep fpr | head -n1 | cut -d: -f10)
+            
+            if [ -z "$KEY_FINGERPRINT" ]; then
+                echo "❌ Error: Could not extract GPG Fingerprint."
+                exit 1
+            fi
+            echo "Detected Fingerprint: $KEY_FINGERPRINT"
+            
+            # 6. Trust Key (Fixes 'Do you really want to use this key?' prompt)
+            echo "${KEY_FINGERPRINT}:6:" | su builder -c "gpg --import-ownertrust"
+            
+            # 7. PRIME THE AGENT (Fixes Password Prompt)
+            # If GPG_PASSPHRASE is set, we sign a dummy file to cache the password for the session.
+            if [ ! -z "$GPG_PASSPHRASE" ]; then
+               echo "🔐 Passphrase detected, caching credential..."
+               echo "test" | su builder -c "gpg --batch --yes --passphrase '$GPG_PASSPHRASE' --pinentry-mode loopback --dry-run -s"
+            else
+               echo "🔓 No passphrase provided. Assuming key is passwordless."
+            fi
+            
+            # 8. TEST SIGNING
+            echo "Testing GPG signing..."
+            if ! echo "test" | su builder -c "gpg --batch --yes --clearsign --default-key $KEY_FINGERPRINT"; then
+                echo "❌ GPG SIGNING FAILED! The key likely requires a password that wasn't provided."
+                exit 1
+            else
+                echo "✅ GPG Signing working correctly."
+            fi
+            echo "::endgroup::"
 
-    - name: Parse package list
-      id: pkgs
-      run: |
-        PACKAGES=$(yq e '.packages[]' packages‑list.yaml)
-        echo "PACKAGES=$PACKAGES" >> $GITHUB_ENV
+            # Init DB (Signed)
+            if [ ! -f "repo/$DB_NAME.db.tar.gz" ]; then
+               echo "Creating initial signed database..."
+               su builder -c "repo-add --sign --key $KEY_FINGERPRINT repo/$DB_NAME.db.tar.gz"
+            fi
+            
+            # --- BUILD PACKAGES ---
+            if [ ! -f packages-list.yaml ]; then
+                echo "Error: packages-list.yaml not found!"
+                exit 1
+            fi
+            
+            PACKAGES=$(grep '  -' packages-list.yaml | cut -d'-' -f2- | tr -d ' ' | xargs)
+            
+            echo "::group::Building Packages: $PACKAGES"
+            
+            # Fetch
+            su builder -c "aur fetch $PACKAGES"
+            
+            # Sort Dependencies
+            cd /home/builder
+            su builder -c "aur graph $PACKAGES" | tsort | tac > build_order.txt
+            
+            # Build Loop
+            while read pkg; do
+                echo "--> Building $pkg..."
+                cd /home/builder/$pkg
+                
+                # Sign the PACKAGE
+                su builder -c "makepkg -si --noconfirm --nocheck --sign --key $KEY_FINGERPRINT"
+                
+                # Move artifacts
+                mv *.pkg.tar.zst /workspace/repo/
+                
+                # Add to DB (Signed)
+                cd /workspace/repo
+                su builder -c "repo-add --new --sign --key $KEY_FINGERPRINT --verify $DB_NAME.db.tar.gz *.pkg.tar.zst"
+            done < /home/builder/build_order.txt
+            echo "::endgroup::"
 
-    - name: Prepare local repo dir
-      run: |
-        mkdir ‑p repo
-        cd repo
-        repo‑add custom.db.tar.gz  # create initial empty database
+      - name: Fix Permissions
+        run: sudo chown -R $USER:$USER repo
 
-    - name: Sync & build AUR packages
-      run: |
-        aur sync \
-          --chroot \
-          --sign \
-          --no‑view \
-          --database‑dir repo \
-          $PACKAGES
+      - name: Prepare Pages Site
+        run: |
+          mkdir -p _site/aarch64
+          cp -L repo/* _site/aarch64/
+          
+          # Fix Signature Names
+          cd _site/aarch64
+          if [ -f "lt-aur.db.tar.gz.sig" ]; then
+             cp lt-aur.db.tar.gz.sig lt-aur.db.sig
+             echo "✅ Created lt-aur.db.sig"
+          else
+             echo "❌ CRITICAL ERROR: Database signature missing after build."
+             exit 1
+          fi
+          
+          # HTML Index
+          cd ../..
+          echo "<html><body><h1>lt-aur</h1><ul><li><a href='aarch64/'>aarch64</a></li></ul></body></html>" > _site/index.html
+          echo "<html><body><h1>/aarch64</h1><pre>" > _site/aarch64/index.html
+          ls -1 _site/aarch64 >> _site/aarch64/index.html
+          echo "</pre></body></html>" >> _site/aarch64/index.html
 
-    - name: Commit built repo
-      run: |
-        git config user.name "github‑actions"
-        git config user.email "actions@github.com"
-        git add repo
-        git commit ‑m "Update built AUR repo"
-        git push
-
-    - name: Prepare for Pages
-      run: |
-        mkdir ‑p _site/aarch64
-        cp repo/* _site/aarch64/
-        # generate pacman config
-        cat > _site/myrepo.conf <<EOF
-        [aurrepo]
-        SigLevel = Required TrustedOnly
-        Server = https://${REPO_OWNER}.github.io/${REPO_NAME}/aarch64
-        EOF
-
-    - name: Upload Pages artifact
-      uses: actions/upload‑pages‑artifact@v3
-      with:
-        path: _site
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
 
   deploy:
-    needs: build
-    runs-on: ubuntu‑latest
+    needs: build-arm
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-    - name: Deploy Pages
-      uses: actions/deploy‑pages@v4
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
