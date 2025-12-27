@@ -1,0 +1,129 @@
+name: Build & Publish ARM AUR Repo
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'packages-list.yaml'
+      - '.github/workflows/**'
+  schedule:
+    - cron: '0 0 * * 0' # Weekly rebuild
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build ARM64 AUR Packages
+    runs-on: ubuntu-latest
+    env:
+      REPO_NAME: ${{ github.event.repository.name }}
+      OWNER: ${{ github.repository_owner }}
+      GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+      PACKAGES_YAML: packages-list.yaml
+
+    steps:
+    - name: Checkout Repo
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install PyYAML & yq
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-pip yq
+        pip3 install pyyaml
+
+    - name: Parse packages list
+      id: parse_packages
+      run: |
+        PACKAGES=$(yq e '.packages[]' $PACKAGES_YAML)
+        echo "PACKAGES='$PACKAGES'" >> $GITHUB_ENV
+        echo "Packages: $PACKAGES"
+
+    - name: Setup QEMU for ARM64
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Prepare GPG Key
+      env:
+        GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+        GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      run: |
+        mkdir -p ~/.gnupg
+        echo "$GPG_SIGNING_KEY" | gpg --import
+        echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+        echo "$GPG_PASSPHRASE" | gpg --passphrase-fd 0 --pinentry-mode loopback \
+          --quick-sign-key $GPG_KEY_ID
+        gpg --list-secret-keys
+
+    - name: Fetch AUR PKGBUILDs
+      run: |
+        mkdir -p aur-src
+        cd aur-src
+        for pkg in $PACKAGES; do
+          git clone https://aur.archlinux.org/$pkg.git || true
+        done
+
+    - name: Build packages in Docker
+      run: |
+        mkdir -p built
+        for d in aur-src/*; do
+          pkg=$(basename "$d")
+          echo "=== Building $pkg ==="
+          docker run --rm --privileged \
+            -v "$PWD/aur-src/$pkg:/build" \
+            -v "$HOME/.gnupg:/root/.gnupg" \
+            -w "/build" \
+            archlinux/archlinuxarm:latest-aarch64 \
+            bash -c "
+              pacman -Syu --noconfirm
+              pacman -S --noconfirm base-devel git sudo
+              useradd -m -G wheel -s /bin/bash builder
+              echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+              chown -R builder /build
+              sudo -u builder bash -c '
+                makepkg --cleanbuild --force --noconfirm --sign \
+                  --key $GPG_KEY_ID
+              '
+            "
+          cp aur-src/$pkg/*.pkg.tar.zst built/ || true
+          cp aur-src/$pkg/*.sig built/ || true
+        done
+
+    - name: Create pacman repo
+      run: |
+        mkdir -p _site/aarch64
+        mv built/* _site/aarch64/ || true
+        cd _site/aarch64
+        repo-add myarmrepo.db.tar.gz *.pkg.tar.zst || true
+        ln -sf myarmrepo.db.tar.gz myarmrepo.db
+        ln -sf myarmrepo.files.tar.gz myarmrepo.files
+
+    - name: Generate pacman config
+      run: |
+        cat > _site/myarmrepo.conf << EOF
+        [myarmrepo]
+        SigLevel = Required TrustedOnly
+        Server = https://${OWNER}.github.io/${REPO_NAME}/aarch64
+        EOF
+
+    - name: Upload Pages Artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy Pages
+      uses: actions/deploy-pages@v4
+

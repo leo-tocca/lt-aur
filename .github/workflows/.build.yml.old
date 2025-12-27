@@ -1,0 +1,124 @@
+name: Build and Deploy ARM Packages
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Manual trigger
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly rebuilds
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package_dir: [packages/example-package, packages/another-package]
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup QEMU for ARM64
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Prepare GPG Key
+      env:
+        GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+        GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      run: |
+        mkdir -p ~/.gnupg
+        echo "$GPG_SIGNING_KEY" | gpg --import
+        echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+        echo "$GPG_PASSPHRASE" | gpg --passphrase-fd 0 --pinentry-mode loopback --quick-sign-key ${{ secrets.GPG_KEY_ID }}
+        gpg --list-secret-keys
+
+    - name: Build Package in Docker
+      env:
+        PACKAGE_DIR: ${{ matrix.package_dir }}
+      run: |
+        docker run --rm --privileged \
+          -v "$PWD:/build" \
+          -v "$HOME/.gnupg:/root/.gnupg" \
+          -w "/build" \
+          archlinux/archlinuxarm:latest-aarch64 \
+          bash -c "
+            pacman -Syu --noconfirm
+            pacman -S --noconfirm base-devel git sudo
+            useradd -m -G wheel -s /bin/bash builder
+            echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+            chown -R builder /build
+            sudo -u builder bash -c '
+              cd \"$PACKAGE_DIR\"
+              makepkg --cleanbuild --force --noconfirm --sign --key ${{ secrets.GPG_KEY_ID }}
+            '
+          "
+
+    - name: Collect Artifacts
+      run: |
+        mkdir -p artifacts
+        find packages -name "*.pkg.tar.zst" -exec cp {} artifacts/ \;
+        find packages -name "*.sig" -exec cp {} artifacts/ \;
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: packages
+        path: artifacts/
+        retention-days: 7
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Download Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: packages
+        path: artifacts
+
+    - name: Setup Pages
+      uses: actions/configure-pages@v4
+
+    - name: Create Repository Database
+      run: |
+        mkdir -p _site/aarch64
+        cp artifacts/* _site/aarch64/ 2>/dev/null || true
+        cd _site/aarch64
+        
+        # Create repo database
+        repo-add myrepo.db.tar.gz *.pkg.tar.zst
+        
+        # Create symlinks for compatibility
+        ln -sf myrepo.db.tar.gz myrepo.db
+        ln -sf myrepo.files.tar.gz myrepo.files
+
+    - name: Generate Repository Configuration
+      run: |
+        cat > _site/myrepo.conf << EOF
+        [myrepo]
+        SigLevel = Required TrustedOnly
+        Server = https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/aarch64
+        EOF
+
+    - name: Upload to GitHub Pages
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: _site
+
+    - name: Deploy to GitHub Pages
+      uses: actions/deploy-pages@v4
