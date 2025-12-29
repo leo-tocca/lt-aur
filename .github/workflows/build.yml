@@ -37,10 +37,13 @@ jobs:
             cd /workspace
             DB_NAME="lt-aur"
             
-            # 1. FIX PACMAN SANDBOX (CRITICAL for Docker/QEMU)
-            # Pacman v7+ tries to use Landlock/Sandbox which fails in containers.
-            # We must disable it to allow dependencies to download.
-            sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf
+            # 1. CRITICAL FIX: DISABLE PACMAN SANDBOX
+            # The 'Landlock' error happens because GitHub Actions doesn't support
+            # the new Pacman 7.0 security isolation. We MUST disable it.
+            # We append it to the end of the file to guarantee it works.
+            echo "" >> /etc/pacman.conf
+            echo "[options]" >> /etc/pacman.conf
+            echo "DisableSandbox" >> /etc/pacman.conf
             
             # 2. Update System
             pacman-key --init
@@ -66,6 +69,7 @@ jobs:
             KEY_FINGERPRINT=$(su builder -c "gpg --list-secret-keys --with-colons" | grep fpr | head -n1 | cut -d: -f10)
             echo "${KEY_FINGERPRINT}:6:" | su builder -c "gpg --import-ownertrust"
             
+            # Prime the agent with passphrase
             if [ ! -z "$GPG_PASSPHRASE" ]; then
                echo "test" | su builder -c "gpg --batch --yes --passphrase '$GPG_PASSPHRASE' --pinentry-mode loopback --dry-run -s --armor"
             fi
@@ -103,8 +107,10 @@ jobs:
                 
                 cd "/home/builder/$pkg"
                 
-                # Build & Install Deps & Sign
-                # ADDED '-A' FLAG: Ignores architecture checks (Fixes 'albert' error)
+                # BUILD FIXES:
+                # -A : Ignore architecture (Fixes 'albert is not available for aarch64')
+                # -s : Sync deps (Now works because Sandbox is disabled)
+                # -i : Install built package (Satisfies local deps)
                 su builder -c "makepkg -siA --noconfirm --nocheck --sign --key $KEY_FINGERPRINT"
                 
                 if [ $? -eq 0 ]; then
@@ -116,7 +122,7 @@ jobs:
                     su builder -c "repo-add --new --sign --key $KEY_FINGERPRINT --verify $DB_NAME.db.tar.gz *.pkg.tar.zst"
                 else
                     echo "❌ Failed to build $pkg"
-                    # We continue to the next package instead of crashing
+                    # We continue to next package
                 fi
             done
             echo "::endgroup::"
