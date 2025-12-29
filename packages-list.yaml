@@ -1,3 +1,5 @@
-packages:
+lt-aur-packages:
   - albert
   - vscodium
+  - osc
+  - mint-l-theme 
