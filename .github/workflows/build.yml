@@ -1,11 +1,10 @@
-name: Build ARM Repo
+name: Build lt-aur Repo
 
 on:
   push:
-    branches: [ main ]
     paths:
-      - 'packages/**'
-      - '.github/workflows/build.yml'
+      - 'packages-list.yaml'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:
@@ -20,167 +19,132 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # 1. Detect Changed Packages
-      - name: Get Targets
-        id: targets
-        run: |
-          # If manual run, build ALL packages
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-             echo "Manual trigger: Building all packages"
-             PACKAGES=$(ls packages/ | tr '\n' ' ')
-          else
-             # On push, only build folders that changed
-             PACKAGES=$(git diff --name-only HEAD^ HEAD | grep '^packages/' | cut -d/ -f2 | sort -u | tr '\n' ' ')
-          fi
-
-          if [ -z "$PACKAGES" ]; then
-            echo "No changes detected."
-            echo "defined=false" >> $GITHUB_OUTPUT
-          else
-            echo "Targets: $PACKAGES"
-            echo "defined=true" >> $GITHUB_OUTPUT
-            echo "list=$PACKAGES" >> $GITHUB_OUTPUT
-          fi
 
       - name: Set up QEMU
-        if: steps.targets.outputs.defined == 'true'
         uses: docker/setup-qemu-action@v3
 
       - name: Build in Arch ARM Container
-        if: steps.targets.outputs.defined == 'true'
         uses: addnab/docker-run-action@v3
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-          PACKAGES: ${{ steps.targets.outputs.list }}
           REPO_URL: "https://leo-tocca.github.io/lt-aur/aarch64"
         with:
           image: agners/archlinuxarm
-          # Mount workspace and pass variables
-          options: --platform linux/arm64 -v ${{ github.workspace }}:/workspace -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e PACKAGES -e REPO_URL
+          options: --platform linux/arm64 -v ${{ github.workspace }}:/workspace -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e REPO_URL
           run: |
-            # --- SYSTEM SETUP ---
+            # --- SETUP ---
             cd /workspace
             DB_NAME="lt-aur"
-            mkdir -p repo
             
-            # 1. Update Keyring & Mirrors (Crucial for ARM)
-            echo "::group::System Update"
+            # 1. Update System & Mirrors (Critical)
             pacman-key --init
             pacman-key --populate archlinuxarm
-            # Refresh mirrorlist to ensure we can download dependencies
-            pacman -Syu --noconfirm base-devel git sudo wget || echo "Mirror update failed, trying to continue..."
-            echo "::endgroup::"
+            # Force refresh of package databases (-y) and upgrade (-u)
+            pacman -Syu --noconfirm base-devel git sudo wget
             
             # 2. Setup Builder User
             useradd -m builder
             echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
             chmod 0440 /etc/sudoers.d/builder
-            chown -R builder:builder repo
-
+            
+            # Prepare Repo Dir
+            mkdir -p repo
+            chown builder:builder repo
+            
             # --- GPG SETUP ---
             echo "::group::Configuring GPG"
             su builder -c "mkdir -p ~/.gnupg && chmod 700 ~/.gnupg"
             su builder -c "echo 'allow-loopback-pinentry' >> ~/.gnupg/gpg-agent.conf"
             su builder -c "echo 'pinentry-mode loopback' >> ~/.gnupg/gpg.conf"
             su builder -c "gpgconf --kill gpg-agent"
-            # Import Key
             su builder -c "gpg --batch --import <(echo '$GPG_PRIVATE_KEY')"
             KEY_FINGERPRINT=$(su builder -c "gpg --list-secret-keys --with-colons" | grep fpr | head -n1 | cut -d: -f10)
             echo "${KEY_FINGERPRINT}:6:" | su builder -c "gpg --import-ownertrust"
             
-            # Prime Agent (Fixes password prompt issues)
             if [ ! -z "$GPG_PASSPHRASE" ]; then
                echo "test" | su builder -c "gpg --batch --yes --passphrase '$GPG_PASSPHRASE' --pinentry-mode loopback --dry-run -s --armor"
             fi
             echo "::endgroup::"
 
-            # --- DOWNLOAD EXISTING DB ---
-            echo "::group::Fetching existing repo"
+            # --- RESTORE/INIT DB ---
+            echo "::group::Repo Initialization"
             cd repo
-            # Try to get existing DB so we don't wipe old packages
+            # Try to download existing DB so we don't wipe history
             if wget -q "$REPO_URL/$DB_NAME.db.tar.gz"; then
-                echo "✅ Existing database found."
+                echo "✅ Existing database downloaded."
                 wget -q "$REPO_URL/$DB_NAME.db.tar.gz.sig" || true
             else
-                echo "⚠️ No database found. Starting fresh."
+                echo "⚠️ No existing database found. Creating new."
                 su builder -c "repo-add --sign --key $KEY_FINGERPRINT $DB_NAME.db.tar.gz"
             fi
             cd ..
             echo "::endgroup::"
-
-            # --- BUILD LOOP ---
+            
+            # --- PARSE PACKAGES ---
+            if [ ! -f packages-list.yaml ]; then echo "No package list!"; exit 1; fi
+            
+            # Extract names clean and simple
+            PACKAGES=$(grep '  -' packages-list.yaml | cut -d'-' -f2- | tr -d ' ' | xargs)
+            echo "::group::Target Packages: $PACKAGES"
+            
+            # --- MANUAL BUILD LOOP (Replaces aurutils) ---
             for pkg in $PACKAGES; do
-                # 1. Validate Directory
-                if [ ! -d "packages/$pkg" ]; then
-                    echo "Skipping $pkg (Folder missing)"
-                    continue
-                fi
-                
                 echo "--------------------------------------"
-                echo "Building: $pkg"
+                echo "Building $pkg..."
                 echo "--------------------------------------"
                 
-                # 2. Prepare Source
-                # Copy to builder home to avoid permission errors with mounted volume
+                # Clean start
                 rm -rf "/home/builder/$pkg"
-                cp -r "packages/$pkg" "/home/builder/$pkg"
-                chown -R builder:builder "/home/builder/$pkg"
+                
+                # Clone directly from AUR
+                su builder -c "git clone https://aur.archlinux.org/$pkg.git /home/builder/$pkg"
+                
                 cd "/home/builder/$pkg"
                 
-                # 3. BUILD
-                # makepkg -s (sync deps) -i (install deps)
-                # If dependencies are missing from ARM repo, this will fail.
+                # Build & Install Deps & Sign
+                # This works exactly like aurutils but without the tool dependency
                 su builder -c "makepkg -si --noconfirm --nocheck --sign --key $KEY_FINGERPRINT"
                 
-                if [ $? -ne 0 ]; then
-                    echo "❌ FAILED to build $pkg"
-                    # We exit to stop the pipeline, or remove 'exit 1' to continue to next pkg
-                    exit 1
+                if [ $? -eq 0 ]; then
+                    # Move artifacts (pkg + sig) to repo
+                    mv *.pkg.tar.zst* /workspace/repo/
+                    
+                    # Add to DB
+                    cd /workspace/repo
+                    su builder -c "repo-add --new --sign --key $KEY_FINGERPRINT --verify $DB_NAME.db.tar.gz *.pkg.tar.zst"
+                else
+                    echo "❌ Failed to build $pkg"
+                    # Optional: exit 1 here if you want to stop on first failure
                 fi
-
-                # 4. Save Artifacts
-                # Move package AND signature to repo
-                mv *.pkg.tar.zst* /workspace/repo/
-                
-                # 5. Update Database
-                cd /workspace/repo
-                echo "Adding to database..."
-                su builder -c "repo-add --new --sign --key $KEY_FINGERPRINT --verify $DB_NAME.db.tar.gz *.pkg.tar.zst"
             done
+            echo "::endgroup::"
 
       - name: Fix Permissions
         if: always()
         run: sudo chown -R $USER:$USER repo
 
-      - name: Prepare Pages
-        if: steps.targets.outputs.defined == 'true'
+      - name: Prepare Pages Site
         run: |
           mkdir -p _site/aarch64
           if [ -d "repo" ]; then cp -L repo/* _site/aarch64/; fi
           
-          # Fix Signature Name for Pacman
+          # Fix Signature Names
           cd _site/aarch64
           [ -f "lt-aur.db.tar.gz.sig" ] && cp lt-aur.db.tar.gz.sig lt-aur.db.sig
           
           # Index
           cd ../..
-          echo "<h1>lt-aur</h1>" > _site/index.html
-          echo "<pre>" > _site/aarch64/index.html
-          ls -1 _site/aarch64 >> _site/aarch64/index.html
+          echo "<html><body><h1>lt-aur</h1><pre>" > _site/index.html
+          ls -1 _site/aarch64 >> _site/index.html
 
-      - name: Upload Pages
-        if: steps.targets.outputs.defined == 'true'
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: _site
 
   deploy:
     needs: build-arm
-    if: needs.build-arm.outputs.defined == 'true'
     runs-on: ubuntu-latest
     permissions:
       pages: write
