@@ -37,13 +37,17 @@ jobs:
             cd /workspace
             DB_NAME="lt-aur"
             
-            # 1. Update System & Mirrors (Critical)
+            # 1. FIX PACMAN SANDBOX (CRITICAL for Docker/QEMU)
+            # Pacman v7+ tries to use Landlock/Sandbox which fails in containers.
+            # We must disable it to allow dependencies to download.
+            sed -i 's/^#DisableSandbox/DisableSandbox/' /etc/pacman.conf
+            
+            # 2. Update System
             pacman-key --init
             pacman-key --populate archlinuxarm
-            # Force refresh of package databases (-y) and upgrade (-u)
             pacman -Syu --noconfirm base-devel git sudo wget
             
-            # 2. Setup Builder User
+            # 3. Setup Builder User
             useradd -m builder
             echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
             chmod 0440 /etc/sudoers.d/builder
@@ -70,7 +74,6 @@ jobs:
             # --- RESTORE/INIT DB ---
             echo "::group::Repo Initialization"
             cd repo
-            # Try to download existing DB so we don't wipe history
             if wget -q "$REPO_URL/$DB_NAME.db.tar.gz"; then
                 echo "✅ Existing database downloaded."
                 wget -q "$REPO_URL/$DB_NAME.db.tar.gz.sig" || true
@@ -83,12 +86,10 @@ jobs:
             
             # --- PARSE PACKAGES ---
             if [ ! -f packages-list.yaml ]; then echo "No package list!"; exit 1; fi
-            
-            # Extract names clean and simple
             PACKAGES=$(grep '  -' packages-list.yaml | cut -d'-' -f2- | tr -d ' ' | xargs)
             echo "::group::Target Packages: $PACKAGES"
             
-            # --- MANUAL BUILD LOOP (Replaces aurutils) ---
+            # --- BUILD LOOP ---
             for pkg in $PACKAGES; do
                 echo "--------------------------------------"
                 echo "Building $pkg..."
@@ -103,8 +104,8 @@ jobs:
                 cd "/home/builder/$pkg"
                 
                 # Build & Install Deps & Sign
-                # This works exactly like aurutils but without the tool dependency
-                su builder -c "makepkg -si --noconfirm --nocheck --sign --key $KEY_FINGERPRINT"
+                # ADDED '-A' FLAG: Ignores architecture checks (Fixes 'albert' error)
+                su builder -c "makepkg -siA --noconfirm --nocheck --sign --key $KEY_FINGERPRINT"
                 
                 if [ $? -eq 0 ]; then
                     # Move artifacts (pkg + sig) to repo
@@ -115,7 +116,7 @@ jobs:
                     su builder -c "repo-add --new --sign --key $KEY_FINGERPRINT --verify $DB_NAME.db.tar.gz *.pkg.tar.zst"
                 else
                     echo "❌ Failed to build $pkg"
-                    # Optional: exit 1 here if you want to stop on first failure
+                    # We continue to the next package instead of crashing
                 fi
             done
             echo "::endgroup::"
