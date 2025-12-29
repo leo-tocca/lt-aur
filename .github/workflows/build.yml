@@ -37,13 +37,13 @@ jobs:
             cd /workspace
             DB_NAME="lt-aur"
             
-            # 1. CRITICAL FIX: DISABLE PACMAN SANDBOX
-            # The 'Landlock' error happens because GitHub Actions doesn't support
-            # the new Pacman 7.0 security isolation. We MUST disable it.
-            # We append it to the end of the file to guarantee it works.
+            # 1. DISABLE PACMAN SANDBOX & SIG CHECKS
+            # DisableSandbox: Fixes 'Landlock' crash in Docker
+            # SigLevel = Never: Allows installing the unsigned packages we build locally
             echo "" >> /etc/pacman.conf
             echo "[options]" >> /etc/pacman.conf
             echo "DisableSandbox" >> /etc/pacman.conf
+            sed -i 's/SigLevel = .*/SigLevel = Never/' /etc/pacman.conf
             
             # 2. Update System
             pacman-key --init
@@ -62,17 +62,13 @@ jobs:
             # --- GPG SETUP ---
             echo "::group::Configuring GPG"
             su builder -c "mkdir -p ~/.gnupg && chmod 700 ~/.gnupg"
+            # Standard config (TTL doesn't matter as much now, but good to keep)
             su builder -c "echo 'allow-loopback-pinentry' >> ~/.gnupg/gpg-agent.conf"
             su builder -c "echo 'pinentry-mode loopback' >> ~/.gnupg/gpg.conf"
             su builder -c "gpgconf --kill gpg-agent"
             su builder -c "gpg --batch --import <(echo '$GPG_PRIVATE_KEY')"
             KEY_FINGERPRINT=$(su builder -c "gpg --list-secret-keys --with-colons" | grep fpr | head -n1 | cut -d: -f10)
             echo "${KEY_FINGERPRINT}:6:" | su builder -c "gpg --import-ownertrust"
-            
-            # Prime the agent with passphrase
-            if [ ! -z "$GPG_PASSPHRASE" ]; then
-               echo "test" | su builder -c "gpg --batch --yes --passphrase '$GPG_PASSPHRASE' --pinentry-mode loopback --dry-run -s --armor"
-            fi
             echo "::endgroup::"
 
             # --- RESTORE/INIT DB ---
@@ -83,6 +79,7 @@ jobs:
                 wget -q "$REPO_URL/$DB_NAME.db.tar.gz.sig" || true
             else
                 echo "⚠️ No existing database found. Creating new."
+                # We prime the passphrase here just for repo-add
                 su builder -c "repo-add --sign --key $KEY_FINGERPRINT $DB_NAME.db.tar.gz"
             fi
             cd ..
@@ -99,30 +96,36 @@ jobs:
                 echo "Building $pkg..."
                 echo "--------------------------------------"
                 
-                # Clean start
                 rm -rf "/home/builder/$pkg"
-                
-                # Clone directly from AUR
                 su builder -c "git clone https://aur.archlinux.org/$pkg.git /home/builder/$pkg"
                 
                 cd "/home/builder/$pkg"
                 
-                # BUILD FIXES:
-                # -A : Ignore architecture (Fixes 'albert is not available for aarch64')
-                # -s : Sync deps (Now works because Sandbox is disabled)
-                # -i : Install built package (Satisfies local deps)
-                su builder -c "makepkg -siA --noconfirm --nocheck --sign --key $KEY_FINGERPRINT"
+                # 1. BUILD (NO SIGNING)
+                # We use --nosign to prevent GPG timeout during compilation
+                su builder -c "makepkg -siA --noconfirm --nocheck --nosign"
                 
                 if [ $? -eq 0 ]; then
-                    # Move artifacts (pkg + sig) to repo
-                    mv *.pkg.tar.zst* /workspace/repo/
+                    echo "✅ Build successful. Signing package..."
                     
-                    # Add to DB
+                    # 2. SIGN MANUALLY
+                    # Find the package file (zst, xz, etc)
+                    PKG_FILE=$(ls *.pkg.tar.* | grep -v '.sig' | head -n 1)
+                    
+                    # Sign it explicitly. This refreshes the GPG session instantly.
+                    # We pass the passphrase directly to ensure no timeout issues.
+                    su builder -c "gpg --batch --yes --passphrase '$GPG_PASSPHRASE' --pinentry-mode loopback --detach-sign --no-armor --local-user $KEY_FINGERPRINT $PKG_FILE"
+                    
+                    # 3. MOVE & UPDATE DB
+                    mv *.pkg.tar.* /workspace/repo/
                     cd /workspace/repo
-                    su builder -c "repo-add --new --sign --key $KEY_FINGERPRINT --verify $DB_NAME.db.tar.gz *.pkg.tar.zst"
+                    
+                    # Re-prime/refresh agent for repo-add (just in case)
+                    # We use repo-add to sign the database
+                    echo "Adding to database..."
+                    su builder -c "repo-add --new --sign --key $KEY_FINGERPRINT --verify $DB_NAME.db.tar.gz *.pkg.tar.*"
                 else
                     echo "❌ Failed to build $pkg"
-                    # We continue to next package
                 fi
             done
             echo "::endgroup::"
