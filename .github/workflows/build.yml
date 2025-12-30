@@ -1,10 +1,10 @@
-name: Build lt-aur Repo
+name: Build ARM Repo (Native)
 
 on:
   push:
+    branches: [ main ]
     paths:
-      - 'packages-list.yaml'
-      - '.github/workflows/**'
+      - 'packages/**'
   workflow_dispatch:
 
 permissions:
@@ -13,156 +13,112 @@ permissions:
   id-token: write
 
 jobs:
-  build-arm:
-    runs-on: ubuntu-latest
+  build-native:
+    # ⚡ MAGIC LINE: Use GitHub's native ARM runner
+    runs-on: ubuntu-24.04-arm
     
+    # Run the entire job inside a clean Arch Linux container
+    container:
+      image: archlinux:base-devel
+      options: --privileged # Required for some build tools
+    
+    env:
+      GPG_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      
     steps:
-      - name: Checkout
+      - name: Install System Prerequisites
+        run: |
+          # 1. Initialize Pacman
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Syu --noconfirm git sudo go
+          
+          # 2. Install 'yay' (or any AUR helper) to simplify dependency handling
+          #    We build it manually once since we are in a bare container
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers
+          su builder -c "git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin && cd /tmp/yay-bin && makepkg -si --noconfirm"
+
+      - name: Checkout Repo
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Build in Arch ARM Container
-        uses: addnab/docker-run-action@v3
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_SIGNING_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-          REPO_URL: "https://leo-tocca.github.io/lt-aur/aarch64"
         with:
-          image: agners/archlinuxarm
-          options: --platform linux/arm64 -v ${{ github.workspace }}:/workspace -e GPG_PRIVATE_KEY -e GPG_PASSPHRASE -e REPO_URL
-          run: |
-            # --- SETUP ---
-            cd /workspace
-            DB_NAME="lt-aur"
-            
-            # 1. DISABLE PACMAN SANDBOX & SIG CHECKS
-            # DisableSandbox: Fixes 'Landlock' crash in Docker
-            # SigLevel = Never: Allows installing the unsigned packages we build locally
-            echo "" >> /etc/pacman.conf
-            echo "[options]" >> /etc/pacman.conf
-            echo "DisableSandbox" >> /etc/pacman.conf
-            sed -i 's/SigLevel = .*/SigLevel = Never/' /etc/pacman.conf
-            
-            # 2. Update System
-            pacman-key --init
-            pacman-key --populate archlinuxarm
-            pacman -Syu --noconfirm base-devel git sudo wget
-            
-            # 3. Setup Builder User
-            useradd -m builder
-            echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
-            chmod 0440 /etc/sudoers.d/builder
-            
-            # Prepare Repo Dir
-            mkdir -p repo
-            chown builder:builder repo
-            
-            # --- GPG SETUP ---
-            echo "::group::Configuring GPG"
-            su builder -c "mkdir -p ~/.gnupg && chmod 700 ~/.gnupg"
-            # Standard config (TTL doesn't matter as much now, but good to keep)
-            su builder -c "echo 'allow-loopback-pinentry' >> ~/.gnupg/gpg-agent.conf"
-            su builder -c "echo 'pinentry-mode loopback' >> ~/.gnupg/gpg.conf"
-            su builder -c "gpgconf --kill gpg-agent"
-            su builder -c "gpg --batch --import <(echo '$GPG_PRIVATE_KEY')"
-            KEY_FINGERPRINT=$(su builder -c "gpg --list-secret-keys --with-colons" | grep fpr | head -n1 | cut -d: -f10)
-            echo "${KEY_FINGERPRINT}:6:" | su builder -c "gpg --import-ownertrust"
-            echo "::endgroup::"
+          fetch-depth: 2
 
-            # --- RESTORE/INIT DB ---
-            echo "::group::Repo Initialization"
-            cd repo
-            if wget -q "$REPO_URL/$DB_NAME.db.tar.gz"; then
-                echo "✅ Existing database downloaded."
-                wget -q "$REPO_URL/$DB_NAME.db.tar.gz.sig" || true
-            else
-                echo "⚠️ No existing database found. Creating new."
-                # We prime the passphrase here just for repo-add
-                su builder -c "repo-add --sign --key $KEY_FINGERPRINT $DB_NAME.db.tar.gz"
-            fi
-            cd ..
-            echo "::endgroup::"
-            
-            # --- PARSE PACKAGES ---
-            if [ ! -f packages-list.yaml ]; then echo "No package list!"; exit 1; fi
-            PACKAGES=$(grep '  -' packages-list.yaml | cut -d'-' -f2- | tr -d ' ' | xargs)
-            echo "::group::Target Packages: $PACKAGES"
-            
-            # --- BUILD LOOP ---
-            for pkg in $PACKAGES; do
-                echo "--------------------------------------"
-                echo "Building $pkg..."
-                echo "--------------------------------------"
-                
-                rm -rf "/home/builder/$pkg"
-                su builder -c "git clone https://aur.archlinux.org/$pkg.git /home/builder/$pkg"
-                
-                cd "/home/builder/$pkg"
-                
-                # 1. BUILD (NO SIGNING)
-                # We use --nosign to prevent GPG timeout during compilation
-                su builder -c "makepkg -siA --noconfirm --nocheck --nosign"
-                
-                if [ $? -eq 0 ]; then
-                    echo "✅ Build successful. Signing package..."
-                    
-                    # 2. SIGN MANUALLY
-                    # Find the package file (zst, xz, etc)
-                    PKG_FILE=$(ls *.pkg.tar.* | grep -v '.sig' | head -n 1)
-                    
-                    # Sign it explicitly. This refreshes the GPG session instantly.
-                    # We pass the passphrase directly to ensure no timeout issues.
-                    su builder -c "gpg --batch --yes --passphrase '$GPG_PASSPHRASE' --pinentry-mode loopback --detach-sign --no-armor --local-user $KEY_FINGERPRINT $PKG_FILE"
-                    
-                    # 3. MOVE & UPDATE DB
-                    mv *.pkg.tar.* /workspace/repo/
-                    cd /workspace/repo
-                    
-                    # Re-prime/refresh agent for repo-add (just in case)
-                    # We use repo-add to sign the database
-                    echo "Adding to database..."
-                    su builder -c "repo-add --new --sign --key $KEY_FINGERPRINT --verify $DB_NAME.db.tar.gz *.pkg.tar.*"
-                else
-                    echo "❌ Failed to build $pkg"
-                fi
-            done
-            echo "::endgroup::"
+      - name: Configure GPG
+        run: |
+          # Import Key
+          su builder -c "mkdir -p ~/.gnupg && chmod 700 ~/.gnupg"
+          su builder -c "echo '$GPG_KEY' | gpg --batch --import"
+          
+          # Get Key ID
+          KEY_ID=$(su builder -c "gpg --list-secret-keys --with-colons" | grep fpr | head -n1 | cut -d: -f10)
+          echo "KEY_ID=$KEY_ID" >> $GITHUB_ENV
+          
+          # Trust Key & Fix Agent
+          echo "${KEY_ID}:6:" | su builder -c "gpg --import-ownertrust"
+          su builder -c "echo 'allow-loopback-pinentry' >> ~/.gnupg/gpg-agent.conf"
+          su builder -c "echo 'pinentry-mode loopback' >> ~/.gnupg/gpg.conf"
+          su builder -c "gpgconf --kill gpg-agent"
+          
+          # Prime Passphrase (if set)
+          if [ ! -z "$GPG_PASSPHRASE" ]; then
+             echo "test" | su builder -c "gpg --batch --yes --passphrase '$GPG_PASSPHRASE' --pinentry-mode loopback --dry-run -s"
+          fi
+
+      - name: Detect Changed Packages
+        id: changes
+        run: |
+          # Simple git diff to find which folders in 'packages/' changed
+          # Native git works perfectly here
+          git config --global --add safe.directory $GITHUB_WORKSPACE
+          CHANGED=$(git diff --name-only HEAD^ HEAD | grep '^packages/' | cut -d/ -f2 | sort -u | tr '\n' ' ')
+          echo "Detected changes: $CHANGED"
+          echo "list=$CHANGED" >> $GITHUB_OUTPUT
+
+      - name: Build & Sign Packages
+        if: steps.changes.outputs.list != ''
+        run: |
+          # Setup Repo Dir
+          mkdir -p repo
+          chown builder:builder repo
+          
+          # Load previous DB if exists (optional, otherwise start fresh)
+          # wget -q https://leo-tocca.github.io/lt-aur/aarch64/lt-aur.db.tar.gz -O repo/lt-aur.db.tar.gz || true
+          
+          # Iterate changes
+          for pkg in ${{ steps.changes.outputs.list }}; do
+             if [ ! -d "packages/$pkg" ]; then continue; fi
+             echo "Building $pkg..."
+             
+             # Copy PKGBUILD to builder home
+             cp -r "packages/$pkg" "/home/builder/$pkg"
+             chown -R builder:builder "/home/builder/$pkg"
+             
+             cd "/home/builder/$pkg"
+             
+             # ⚡ NATIVE BUILD with Internet Access!
+             # We can run 'makepkg -s' and it will download deps automatically.
+             # No "aur sync" complexity needed.
+             su builder -c "makepkg -si --noconfirm --nocheck --sign --key ${{ env.KEY_ID }}"
+             
+             # Move results
+             mv *.pkg.tar.zst* $GITHUB_WORKSPACE/repo/
+             
+             # Add to DB
+             cd $GITHUB_WORKSPACE/repo
+             su builder -c "repo-add --new --sign --key ${{ env.KEY_ID }} lt-aur.db.tar.gz *.pkg.tar.zst"
+          done
 
       - name: Fix Permissions
         if: always()
-        run: sudo chown -R $USER:$USER repo
+        run: chown -R root:root repo
 
-      - name: Prepare Pages Site
-        run: |
-          mkdir -p _site/aarch64
-          if [ -d "repo" ]; then cp -L repo/* _site/aarch64/; fi
-          
-          # Fix Signature Names
-          cd _site/aarch64
-          [ -f "lt-aur.db.tar.gz.sig" ] && cp lt-aur.db.tar.gz.sig lt-aur.db.sig
-          
-          # Index
-          cd ../..
-          echo "<html><body><h1>lt-aur</h1><pre>" > _site/index.html
-          ls -1 _site/aarch64 >> _site/index.html
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: _site
-
-  deploy:
-    needs: build-arm
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
       - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+        uses: peaceiris/actions-gh-pages@v4
+        if: steps.changes.outputs.list != ''
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./repo
+          destination_dir: aarch64
+          keep_files: true  # Don't delete existing packages!
