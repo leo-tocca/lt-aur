@@ -1,0 +1,47 @@
+name: Check AUR Updates
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:      # Manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  check-updates:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Configure git
+        run: |
+          git config --global user.name "AUR Update Bot"
+          git config --global user.email "bot@github.actions"
+      
+      - name: Check for updates
+        run: |
+          python scripts/check_aur_updates.py
+      
+      - name: Push changes
+        if: success()
+        run: |
+          git push origin main || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Trigger build
+        if: success()
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          event-type: packages-updated
+          token: ${{ secrets.GITHUB_TOKEN }}

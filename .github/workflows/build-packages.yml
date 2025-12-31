@@ -1,0 +1,198 @@
+name: Build Packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/**'
+  repository_dispatch:
+    types: [packages-updated]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.changed.outputs.packages }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      
+      - name: Detect changed packages
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Build all packages
+            packages=$(ls -1 packages | jq -R -s -c 'split("\n")[:-1]')
+          else
+            # Build only changed packages
+            packages=$(git diff --name-only HEAD~1 HEAD | \
+              grep '^packages/' | \
+              cut -d'/' -f2 | \
+              sort -u | \
+              jq -R -s -c 'split("\n")[:-1]')
+          fi
+          echo "packages=$packages" >> $GITHUB_OUTPUT
+          echo "Changed packages: $packages"
+
+  build:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.packages != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: ${{ fromJson(needs.detect-changes.outputs.packages) }}
+      fail-fast: false
+      max-parallel: 3
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      
+      - name: Build package in container
+        run: |
+          mkdir -p output
+          docker run --rm --platform linux/arm64 \
+            -v $(pwd)/packages/${{ matrix.package }}:/build \
+            -v $(pwd)/output:/output \
+            archlinux:latest \
+            bash -c '
+              useradd -m builder
+              echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+              pacman -Syu --noconfirm base-devel git
+              
+              cd /build
+              chown -R builder:builder .
+              
+              su builder -c "makepkg -s --noconfirm"
+              mv *.pkg.tar.zst /output/ || echo "No package built"
+            '
+      
+      - name: Check build output
+        run: |
+          if [ ! -f output/*.pkg.tar.zst ]; then
+            echo "❌ No package file found for ${{ matrix.package }}"
+            exit 1
+          fi
+          ls -lah output/
+      
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          gpg --list-keys
+      
+      - name: Sign packages
+        run: |
+          cd output
+          for pkg in *.pkg.tar.zst; do
+            echo "${{ secrets.GPG_PASSPHRASE }}" | \
+            gpg --batch --yes --passphrase-fd 0 \
+              --detach-sign --armor "$pkg"
+            echo "✓ Signed $pkg"
+          done
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.package }}
+          path: output/*
+          retention-days: 7
+
+  create-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: pkg-*
+          merge-multiple: true
+      
+      - name: List artifacts
+        run: |
+          echo "📦 Built packages:"
+          ls -lah artifacts/
+      
+      - name: Prepare release
+        id: prep
+        run: |
+          echo "date=$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          echo "tag=repo-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.prep.outputs.tag }}
+          name: Repository ${{ steps.prep.outputs.date }}
+          files: artifacts/*
+          body: |
+            🤖 Automated build - ${{ steps.prep.outputs.date }}
+            
+            Packages built: ${{ needs.detect-changes.outputs.packages }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-database:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install pacman
+        run: |
+          # Install pacman on Ubuntu
+          sudo apt-get update
+          sudo apt-get install -y wget
+          wget http://archive.ubuntu.com/ubuntu/pool/universe/p/pacman/pacman_6.0.1-2_amd64.deb
+          sudo dpkg -i pacman_6.0.1-2_amd64.deb || sudo apt-get install -f -y
+      
+      - name: Import GPG key
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          gpg --list-keys
+      
+      - name: Download packages from latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p repo
+          latest_tag=$(gh release list -R ${{ github.repository }} --limit 1 | awk '{print $1}')
+          echo "📥 Downloading from release: $latest_tag"
+          gh release download "$latest_tag" -R ${{ github.repository }} -p "*.pkg.tar.zst" -D repo
+          ls -lah repo/
+      
+      - name: Create repository database
+        run: |
+          cd repo
+          echo "🔨 Creating repository database..."
+          echo "${{ secrets.GPG_PASSPHRASE }}" | \
+          repo-add -s -k ${{ secrets.GPG_KEY_ID }} \
+            --verify --sign \
+            lt-aur.db.tar.gz *.pkg.tar.zst
+          
+          echo "✓ Database created:"
+          ls -lah lt-aur.*
+      
+      - name: Upload database to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          latest_tag=$(gh release list -R ${{ github.repository }} --limit 1 | awk '{print $1}')
+          echo "📤 Uploading database to release: $latest_tag"
+          gh release upload "$latest_tag" -R ${{ github.repository }} \
+            repo/lt-aur.db.tar.gz \
+            repo/lt-aur.files.tar.gz \
+            --clobber
+          echo "✅ Repository database updated"

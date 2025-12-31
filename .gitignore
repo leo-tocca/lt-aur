@@ -1,0 +1,40 @@
+# Build outputs
+output/
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+*.pkg.tar.zst.asc
+
+# Makepkg artifacts
+src/
+pkg/
+*.log
+
+# Temporary files
+*~
+*.swp
+*.swo
+.DS_Store
+
+# AUR temporary clones
+*_temp/
+temp/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Repository database (generated in CI)
+lt-aur.db.tar.gz
+lt-aur.files.tar.gz
+lt-aur.db
+lt-aur.files
+
+# Keep these specific files
+!packages/*/PKGBUILD
+!packages/*/.SRCINFO
+!packages/*/*.install
+!packages/*/*.patch
+
+monorepo_migration.sh
+parse_packages.py

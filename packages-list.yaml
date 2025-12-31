@@ -1,5 +1,24 @@
 lt-aur-packages:
   - albert
-  - vscodium
   - osc
-  - mint-l-theme 
+  - mint-l-theme
+  - bbe
+  - circle-flags
+  - debtap
+  - etherwake
+  - gtk2
+  - hypnotix
+  - keepassxc-wordlist-italian
+  - mint-backgrounds
+  - mint-l-icons
+  - neofetch
+  - openfortigui-git
+  - powerjoular
+  - python-cinemagoer
+  - python-clickgen
+  - qt5-singlecoreapplication
+  - sselp
+  - swarp
+  - tabbed
+  - webapp-manager
+
