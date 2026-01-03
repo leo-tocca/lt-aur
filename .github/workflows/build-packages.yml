@@ -65,11 +65,11 @@ jobs:
           docker run --rm --platform linux/arm64 \
             -v $(pwd)/packages/${{ matrix.package }}:/build \
             -v $(pwd)/output:/output \
-            archlinux:latest \
+            lopsided/archlinux:aarch64-devel \
             bash -c '
               useradd -m builder
               echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-              pacman -Syu --noconfirm base-devel git
+              pacman -Sy --noconfirm git
               
               cd /build
               chown -R builder:builder .
