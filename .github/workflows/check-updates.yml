@@ -28,6 +28,11 @@ jobs:
           git config --global user.name "AUR Update Bot"
           git config --global user.email "bot@github.actions"
       
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip  # Upgrade pip
+          pip install -r scripts/requirements.txt  # Install dependencies
+
       - name: Check for updates
         run: |
           python scripts/check_aur_updates.py

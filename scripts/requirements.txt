@@ -1,0 +1,3 @@
+PyYAML
+requests  # Optional, if you decide to use this instead of urllib
+
