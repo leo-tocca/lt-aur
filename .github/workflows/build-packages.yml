@@ -65,18 +65,20 @@ jobs:
           docker run --rm --platform linux/arm64 \
             -v $(pwd)/packages/${{ matrix.package }}:/build \
             -v $(pwd)/output:/output \
-            lopsided/archlinux-arm64v8 \
-            bash -c '
+            ghcr.io/archlinux/archlinux:latest \
+            bash -euxo pipefail -c '
+              pacman -Syu --noconfirm base-devel git sudo
+
               useradd -m builder
               echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-              pacman -Sy --noconfirm git
-              
+
               cd /build
               chown -R builder:builder .
-              
+
               su builder -c "makepkg -s --noconfirm"
-              mv *.pkg.tar.zst /output/ || echo "No package built"
-            '
+
+              mv *.pkg.tar.zst /output/
+            
       
       - name: Check build output
         run: |
