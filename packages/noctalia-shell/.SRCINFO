@@ -1,0 +1,26 @@
+pkgbase = noctalia-shell
+	pkgdesc = A sleek and minimal desktop shell thoughtfully crafted for Wayland, built with Quickshell.
+	pkgver = 3.8.2
+	pkgrel = 1
+	url = https://github.com/noctalia-dev/noctalia-shell
+	install = noctalia-shell.install
+	arch = any
+	license = MIT
+	makedepends = git
+	depends = quickshell
+	depends = imagemagick
+	depends = gpu-screen-recorder
+	depends = brightnessctl
+	depends = ffmpeg
+	depends = qt6-multimedia
+	optdepends = cliphist: For clipboard history support
+	optdepends = matugen: Material You color scheme generation
+	optdepends = cava: Audio visualizer component
+	optdepends = wlsunset: For supporting NightLight
+	optdepends = power-profiles-daemon: For power profile management
+	optdepends = ddcutil: For external display brightness control
+	conflicts = noctalia-shell-git
+	source = git+https://github.com/noctalia-dev/noctalia-shell.git#tag=v3.8.2
+	sha256sums = 8ed1517be27c484e6baee8bb1afdd14e9054bbb3eb676549064afc652c85e3a3
+
+pkgname = noctalia-shell
