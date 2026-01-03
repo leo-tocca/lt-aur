@@ -73,8 +73,9 @@ def download_aur_pkgbuild(pkgname: str, dest_dir: Path) -> bool:
         print(f"❌ Failed to download {pkgname}: {e.stderr.decode() if e.stderr else 'Unknown error'}", file=sys.stderr)
         return False
 
+"""
 def load_packages_list() -> list:
-    """Load packages from packages-list.yaml."""
+   #Load packages from packages-list.yaml.s
     yaml_path = Path('packages-list.yaml')
     if not yaml_path.exists():
         print("❌ packages-list.yaml not found", file=sys.stderr)
@@ -83,7 +84,7 @@ def load_packages_list() -> list:
     try:
         with open(yaml_path, 'r') as f:
             data = yaml.safe_load(f)
-            if isinstance(data, list):
+            if 'lt-aur-packages' in data and isinstance(data['lt-aur-packages'], list):
                 return data
             else:
                 print("❌ packages-list.yaml should contain a list", file=sys.stderr)
@@ -91,6 +92,27 @@ def load_packages_list() -> list:
     except Exception as e:
         print(f"❌ Error parsing packages-list.yaml: {e}", file=sys.stderr)
         sys.exit(1)
+
+"""
+def load_packages_list() -> list:
+    #Load packages from packages-list.yaml.
+    yaml_path = Path('packages-list.yaml')
+    if not yaml_path.exists():
+        print("❌ packages-list.yaml not found", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with open(yaml_path, 'r') as f:
+            data = yaml.safe_load(f)
+            if 'lt-aur-packages' in data and isinstance(data['lt-aur-packages'], list):
+                return data['lt-aur-packages']
+            else:
+                print("❌ packages-list.yaml should contain a list under 'lt-aur-packages'", file=sys.stderr)
+                sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error parsing packages-list.yaml: {e}", file=sys.stderr)
+        sys.exit(1)
+    
 
 def main():
     packages_dir = Path('packages')
