@@ -78,7 +78,7 @@ jobs:
               su builder -c "makepkg -s --noconfirm"
 
               mv *.pkg.tar.zst /output/
-            
+            '
       
       - name: Check build output
         run: |
